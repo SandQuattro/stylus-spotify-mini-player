@@ -2,69 +2,68 @@ APP_NAME := Stylus
 APP_ID   := com.kass.stylus
 BIN_NAME := stylus
 DEST     := /Applications/$(APP_NAME).app
-# builds run on the MacBook Air (`ssh air`), never on this Mac: its disk is small and Rust
-# target dirs grew ~40 GB. Only the finished app comes back, into a temp dir.
-AIR      := air
-REMOTE   := builds/stylus
-AIR_ENV  := export PATH=/opt/homebrew/bin:$$HOME/.cargo/bin:$$PATH; cd $(REMOTE)
+MACOS    := src-tauri/target/release/bundle/macos
 OUT      := /tmp/stylus-build
-BUNDLE   := $(OUT)/$(APP_NAME).app
-BIN      := $(OUT)/$(BIN_NAME)
 # release builds (make dmg) also make the signed update archive Stylus.app.tar.gz + .sig for the
-# auto-updater (src-tauri/src/updater.rs). The key stays on the Air (empty password); plain builds
+# auto-updater (src-tauri/src/updater.rs) when the key file is here (empty password); plain builds
 # (install, run) leave createUpdaterArtifacts off and need no key.
 UPD_KEY  := ~/.config/stylus/updater.key
 UPD_CONF := {\"bundle\":{\"createUpdaterArtifacts\":true}}
-UPD_ENV  := { test -s $(UPD_KEY) || { echo "no updater key $(UPD_KEY) on the Air" >&2; false; }; } && export TAURI_SIGNING_PRIVATE_KEY="$$(cat $(UPD_KEY))" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=
 # the app under its old names (Needle, rust-spotify): quit it too, it shares the Connect device id
 OLD_APP_IDS   := com.kass.needle com.kass.rustspotify
 OLD_BIN_NAMES := Needle needle rust-spotify
 
-.PHONY: install run stop sync test dmg release
+.PHONY: install run stop test dmg release
 
-## sync: copy the source to the Air (no node_modules, no target, no git)
-sync:
-	ssh $(AIR) 'mkdir -p $(REMOTE)'
-	rsync -a --delete --exclude node_modules --exclude src-tauri/target --exclude .git --exclude media --exclude spikes ./ $(AIR):$(REMOTE)/
+## node_modules: npm ci again whenever package-lock.json is newer
+node_modules: package-lock.json
+	npm ci --silent
 
-## test: frontend + backend tests on the Air
-test: sync
-	ssh $(AIR) '$(AIR_ENV) && npm ci --silent && npx vitest run && cargo test --manifest-path src-tauri/Cargo.toml --quiet'
+## test: frontend (vitest) and backend (cargo) tests
+test: node_modules
+	npx vitest run
+	cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
-## install: release Stylus.app built on the Air, copied here into /Applications, then opened
-install: sync
-	ssh $(AIR) '$(AIR_ENV) && npm ci --silent && npx tauri build --bundles app'
-	mkdir -p $(OUT)
-	rsync -a --delete $(AIR):$(REMOTE)/src-tauri/target/release/bundle/macos/$(APP_NAME).app/ $(BUNDLE)/
+## install: release Stylus.app built here, put into /Applications (the old copy goes to /tmp/trash), then opened
+install: node_modules
+	npx tauri build --bundles app
 	$(MAKE) stop
 	@if [ -d "$(DEST)" ]; then mkdir -p /tmp/trash && mv "$(DEST)" "/tmp/trash/$(APP_NAME).app.$$(date +%Y%m%d-%H%M%S)"; fi
 	@# the app under its old names: a second copy would be a second "This Mac" speaker
 	@for old in Needle rust-spotify; do if [ -d "/Applications/$$old.app" ]; then mkdir -p /tmp/trash && mv "/Applications/$$old.app" "/tmp/trash/$$old.app.$$(date +%Y%m%d-%H%M%S)"; fi; done
-	ditto "$(BUNDLE)" "$(DEST)"
+	ditto "$(MACOS)/$(APP_NAME).app" "$(DEST)"
 	@# LaunchServices refuses (-600) while the old copy is still exiting: wait, then retry once
 	@sleep 2; open "$(DEST)" || { sleep 3; open "$(DEST)"; }
 
-## run: fresh release build on the Air, run here as a bare binary: no .app, so no Dock icon = the dev build
-run: sync
-	ssh $(AIR) '$(AIR_ENV) && npm ci --silent && npx tauri build --no-bundle'
-	mkdir -p $(OUT)
-	rsync -a $(AIR):$(REMOTE)/src-tauri/target/release/$(BIN_NAME) $(BIN)
+## run: fresh release build, run as a bare binary: no .app, so no Dock icon = the dev build
+run: node_modules
+	npx tauri build --no-bundle
 	$(MAKE) stop
-	$(BIN)
+	src-tauri/target/release/$(BIN_NAME)
 
-## dmg: the DMG and the signed update archive for a release, built on the Air, copied to $(OUT)/dmg.
-## hdiutil, not Tauri's bundle_dmg.sh: that script drives Finder over AppleScript, which fails in an SSH session.
-dmg: sync
-	ssh $(AIR) '$(AIR_ENV) && $(UPD_ENV) && npm ci --silent && npx tauri build --bundles app --config "$(UPD_CONF)" && rm -rf /tmp/stylus-dmg && mkdir -p /tmp/stylus-dmg/src && cp -R src-tauri/target/release/bundle/macos/$(APP_NAME).app /tmp/stylus-dmg/src/ && cp src-tauri/target/release/bundle/macos/$(APP_NAME).app.tar.gz src-tauri/target/release/bundle/macos/$(APP_NAME).app.tar.gz.sig /tmp/stylus-dmg/ && ln -s /Applications /tmp/stylus-dmg/src/Applications && hdiutil create -volname $(APP_NAME) -srcfolder /tmp/stylus-dmg/src -ov -format UDZO /tmp/stylus-dmg/$(APP_NAME).dmg'
-	mkdir -p $(OUT)/dmg
-	rsync -a "$(AIR):/tmp/stylus-dmg/$(APP_NAME).dmg" $(OUT)/dmg/
-	rsync -a "$(AIR):/tmp/stylus-dmg/$(APP_NAME).app.tar.gz*" $(OUT)/dmg/
+## dmg: $(OUT)/dmg/Stylus.dmg. With the updater key also the signed update archive a release needs
+## (make release DMG=local); without it a DMG to install by hand.
+## hdiutil, not Tauri's bundle_dmg.sh: that script drives Finder over AppleScript.
+dmg: node_modules
+	rm -rf $(OUT)/dmg $(OUT)/dmg-src
+	mkdir -p $(OUT)/dmg $(OUT)/dmg-src
+	@if [ -s $(UPD_KEY) ]; then \
+		TAURI_SIGNING_PRIVATE_KEY="$$(cat $(UPD_KEY))" TAURI_SIGNING_PRIVATE_KEY_PASSWORD= npx tauri build --bundles app --config "$(UPD_CONF)" && \
+		cp $(MACOS)/$(APP_NAME).app.tar.gz $(MACOS)/$(APP_NAME).app.tar.gz.sig $(OUT)/dmg/; \
+	else \
+		echo "no updater key $(UPD_KEY): the DMG comes without the update archive"; \
+		npx tauri build --bundles app; \
+	fi
+	cp -R $(MACOS)/$(APP_NAME).app $(OUT)/dmg-src/
+	ln -s /Applications $(OUT)/dmg-src/Applications
+	hdiutil create -volname $(APP_NAME) -srcfolder $(OUT)/dmg-src -ov -format UDZO $(OUT)/dmg/$(APP_NAME).dmg
+	rm -rf $(OUT)/dmg-src
 	shasum -a 256 $(OUT)/dmg/$(APP_NAME).dmg
 
 ## release: version bump, tag, DMG, release notes and Homebrew cask in one run (scripts/release.py).
-## V=0.3.1 NOTES=<file of "- " highlight lines> [DMG=air: build the DMG on the Air, not in CI] [DRY=1: change nothing]
+## V=0.3.1 NOTES=<file of "- " highlight lines> [DMG=local: build the DMG here (make dmg), not in CI] [DRY=1: change nothing]
 release:
-	@test -n "$(V)" -a -n "$(NOTES)" || { echo 'usage: make release V=0.3.1 NOTES=/tmp/notes.md [DMG=air] [DRY=1]'; exit 2; }
+	@test -n "$(V)" -a -n "$(NOTES)" || { echo 'usage: make release V=0.3.1 NOTES=/tmp/notes.md [DMG=local] [DRY=1]'; exit 2; }
 	python3 -u scripts/release.py $(V) --notes $(NOTES) --dmg $(or $(DMG),ci) $(if $(DRY),--dry-run)
 
 ## stop: quit every copy, installed (binary may be named Stylus) or dev, new name or old (two copies = two "This Mac" speakers with one device id)

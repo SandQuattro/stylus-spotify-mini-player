@@ -2,7 +2,7 @@
 # (small disk) or Linux. Every push tests and builds; a v* tag also publishes the DMG as a release.
 name: build
 
-# day-to-day builds run on the MacBook Air via `make` (see Makefile); CI is for release tags and manual runs
+# day-to-day builds run on this Mac via `make` (see Makefile); CI is for release tags and manual runs
 on:
   push:
     tags: ["v*"]

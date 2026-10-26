@@ -2,7 +2,7 @@
 """Release Stylus: version bump, tag, DMG, GitHub release notes, Homebrew cask.
 
     make release V=0.3.1 NOTES=/tmp/notes.md            # DMG from CI (the v* tag build)
-    make release V=0.3.1 NOTES=/tmp/notes.md DMG=air    # DMG from the MacBook Air (make dmg)
+    make release V=0.3.1 NOTES=/tmp/notes.md DMG=local  # DMG built on this Mac (make dmg)
     make release V=0.3.1 NOTES=/tmp/notes.md DRY=1      # print the steps, change nothing
 
 NOTES is a markdown file of "- " highlight lines; the script wraps them in the release template.
@@ -30,10 +30,10 @@ TAP = "SandQuattro/homebrew-tap"
 CASK = "Casks/stylus.rb"
 GH_USER = "SandQuattro"
 WORKFLOW = "build.yml"
-# what the app is built from: on --dmg air the working tree must match the tag here
+# what the app is built from: on --dmg local the working tree must match the tag here
 BUILD_PATHS = ["src", "src-tauri", "package.json", "package-lock.json"]
-AIR_OUT = Path("/tmp/stylus-build/dmg")  # where `make dmg` puts the DMG and the update archive
-AIR_DMG = AIR_OUT / "Stylus.dmg"
+DMG_OUT = Path("/tmp/stylus-build/dmg")  # where `make dmg` puts the DMG and the update archive
+UPD_KEY = Path.home() / ".config/stylus/updater.key"  # the Makefile's UPD_KEY: make dmg signs the archive with it
 # a release has all of these: the DMG for installs, the signed archive + feed for auto-updates
 RELEASE_FILES = ["Stylus.dmg", "Stylus.dmg.sha256", "Stylus.app.tar.gz", "Stylus.app.tar.gz.sig", "latest.json"]
 FEED_URL = f"https://github.com/{REPO}/releases/latest/download/latest.json"
@@ -185,9 +185,9 @@ def preflight(version, notes_path, dmg):
     run(["git", "fetch", "-q", "origin", "master", "--tags"])
     if not ok(["git", "merge-base", "--is-ancestor", "origin/master", "HEAD"]):
         sys.exit("✗ origin/master has commits this branch lacks: pull first")
-    if dmg == "air" and not ok(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "air", "true"]):
-        sys.exit("✗ ssh air does not answer")
-    print("  ✓ notes, gh login, git state" + (", the Air" if dmg == "air" else ""))
+    if dmg == "local" and not UPD_KEY.is_file():
+        sys.exit(f"✗ no updater key {UPD_KEY}: make dmg needs it for the update archive")
+    print("  ✓ notes, gh login, git state" + (", the updater key" if dmg == "local" else ""))
 
 
 def bump(version):
@@ -282,13 +282,13 @@ def dmg_ci(t):
             notes.append(a["message"])
     print("\n".join(f"  ! {n}" for n in notes))
     if any("billing" in n for n in notes):
-        sys.exit("✗ GitHub did not start the job (billing). Fix it, or run again with DMG=air")
+        sys.exit("✗ GitHub did not start the job (billing). Fix it, or run again with DMG=local")
     print(run(["gh", "run", "view", rid, "-R", REPO, "--log-failed"], check=False)[-6000:])
     sys.exit(f"✗ build run {rid} failed: fix it, push, then run this again")
 
 
-def dmg_air(t, version, body, notes):
-    step("DMG from the Air")
+def dmg_local(t, version, body, notes):
+    step("DMG from this Mac")
     # make dmg ships the working tree: it must be the tag's source
     changed = run(["git", "diff", "--name-only", t, "--"] + BUILD_PATHS)
     untracked = run(["git", "ls-files", "--others", "--exclude-standard", "--"] + BUILD_PATHS)
@@ -299,7 +299,7 @@ def dmg_air(t, version, body, notes):
     if not DRY:
         r = tag_run(t, 90)
         if not r:
-            sys.exit(f"✗ no build run for {t} after 90 s: a late one could replace the Air DMG")
+            sys.exit(f"✗ no build run for {t} after 90 s: a late one could replace the local DMG")
         if r["status"] != "completed":
             run(["gh", "run", "cancel", str(r["databaseId"]), "-R", REPO], mutate=True)
             while tag_run(t, 5)["status"] != "completed":
@@ -308,12 +308,12 @@ def dmg_air(t, version, body, notes):
     if DRY:
         print(f"  [dry-run] gh release create {t} " + " ".join(RELEASE_FILES))
         return
-    digest = hashlib.sha256(AIR_DMG.read_bytes()).hexdigest()
-    (AIR_OUT / "Stylus.dmg.sha256").write_text(f"{digest}  Stylus.dmg\n")
-    sig = (AIR_OUT / "Stylus.app.tar.gz.sig").read_text()
+    digest = hashlib.sha256((DMG_OUT / "Stylus.dmg").read_bytes()).hexdigest()
+    (DMG_OUT / "Stylus.dmg.sha256").write_text(f"{digest}  Stylus.dmg\n")
+    sig = (DMG_OUT / "Stylus.app.tar.gz.sig").read_text()
     feed = update_feed.feed(version, highlights(notes), sig, tarball_url(version))
-    (AIR_OUT / "latest.json").write_text(update_feed.render(feed))
-    files = [str(AIR_OUT / f) for f in RELEASE_FILES]
+    (DMG_OUT / "latest.json").write_text(update_feed.render(feed))
+    files = [str(DMG_OUT / f) for f in RELEASE_FILES]
     if release_assets(t) is None:
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
             f.write(body)
@@ -392,7 +392,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("version", help="X.Y.Z")
     p.add_argument("--notes", required=True, help='markdown file of "- " highlight lines')
-    p.add_argument("--dmg", choices=["ci", "air"], default="ci", help="who builds the DMG (default: ci)")
+    p.add_argument("--dmg", choices=["ci", "local"], default="ci", help="who builds the DMG (default: ci)")
     p.add_argument("--dry-run", action="store_true", help="print the steps, change nothing")
     a = p.parse_args()
     DRY = a.dry_run
@@ -407,8 +407,8 @@ def main():
     if not missing_assets(release_assets(t)):
         step("DMG and update archive")
         print("  ✓ the release has " + ", ".join(RELEASE_FILES))
-    elif a.dmg == "air":
-        dmg_air(t, a.version, body, notes)
+    elif a.dmg == "local":
+        dmg_local(t, a.version, body, notes)
     else:
         dmg_ci(t)
     notes_step(t, a.version, body)
